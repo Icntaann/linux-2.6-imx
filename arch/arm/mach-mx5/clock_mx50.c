@@ -37,6 +37,10 @@
 #include "crm_regs.h"
 #include "serial.h"
 
+
+#define GDEBUG 0
+#include <linux/gallen_dbg.h>
+
 /* External clock values passed-in by the board code */
 static unsigned long external_high_reference, external_low_reference;
 static unsigned long oscillator_reference, ckih2_reference;
@@ -76,6 +80,7 @@ extern int lp_med_freq;
 void __iomem *databahn;
 
 #define DDR_SYNC_MODE		0x30000
+DEFINE_SPINLOCK(mx50_clk_lock);
 #define SPIN_DELAY	1000000 /* in nanoseconds */
 #define WAIT(exp, timeout) \
 ({ \
@@ -97,6 +102,7 @@ void __iomem *databahn;
 #define MAX_AXI_B_CLK_MX50 	200000000
 #define MAX_AHB_CLK		133333333
 #define MAX_EMI_SLOW_CLK	133000000
+#define LP_APM_CLK		24000000
 
 extern int mxc_jtag_enabled;
 extern int uart_at_24;
@@ -309,6 +315,24 @@ static struct clk ckil_clk = {
 static int apll_enable(struct clk *clk)
 {
 	__raw_writel(1, apll_base + MXC_ANADIG_MISC_SET);
+
+	/* Set bit to flush multiple edges out of PLL vco */
+	__raw_writel(MXC_ANADIG_PLL_HOLD_RING_OFF,
+		apll_base + MXC_ANADIG_MISC_SET);
+
+	__raw_writel(MXC_ANADIG_PLL_POWERUP, apll_base + MXC_ANADIG_MISC_SET);
+ 
+	
+	if (!WAIT(__raw_readl(apll_base + MXC_ANADIG_PLLCTRL)
+		  & MXC_ANADIG_APLL_LOCK, 80000))
+		panic("apll_enable failed!\n");
+		
+	/* Clear after relocking, then wait 10 us */
+	__raw_writel(MXC_ANADIG_PLL_HOLD_RING_OFF,
+		apll_base + MXC_ANADIG_MISC_CLR);
+
+	udelay(10);
+
 	return 0;
 }
 
@@ -378,8 +402,10 @@ static int pfd_enable(struct clk *clk)
 		apbh_dma_clk.enable(&apbh_dma_clk);
 	index = _get_mux8(clk, &pfd0_clk, &pfd1_clk, &pfd2_clk, &pfd3_clk,
 			&pfd4_clk, &pfd5_clk, &pfd6_clk, &pfd7_clk);
+
 	__raw_writel(1 << (index + MXC_ANADIG_PFD_DIS_OFFSET),
-			apll_base + MXC_ANADIG_PLLCTRL_CLR);
+			apll_base + MXC_ANADIG_PLLCTRL_CLR);	
+
 	/* clear clk gate bit */
 	__raw_writel((1 << (clk->enable_shift + 7)),
 			apll_base + (int)clk->enable_reg + 8);
@@ -395,6 +421,7 @@ static int pfd_enable(struct clk *clk)
 			  & MXC_ANADIG_APLL_LOCK, SPIN_DELAY))
 			panic("pfd_enable failed!\n");
 	}
+
 	if (apbh_dma_clk.usecount == 0)
 		apbh_dma_clk.disable(&apbh_dma_clk);
 	return 0;
@@ -412,7 +439,7 @@ static void pfd_disable(struct clk *clk)
 	__raw_writel((1 << (clk->enable_shift + 7)),
 			apll_base + (int)clk->enable_reg + 4);
 	__raw_writel(1 << (index + MXC_ANADIG_PFD_DIS_OFFSET),
-			apll_base + MXC_ANADIG_PLLCTRL_SET);
+			apll_base + MXC_ANADIG_PLLCTRL_SET);	
 	if (apbh_dma_clk.usecount == 0)
 		apbh_dma_clk.disable(&apbh_dma_clk);
 }
@@ -505,6 +532,107 @@ static struct clk pfd7_clk = {
 	.flags = RATE_PROPAGATES | AHB_MED_SET_POINT | CPU_FREQ_TRIG_UPDATE,
 };
 
+static int do_workaround;
+
+static void do_pll_workaround(struct clk *clk, unsigned long rate)
+{
+	u32 reg;
+
+	/*
+	  * Need to apply the PLL1 workaround. Set the PLL initially to 864MHz(1056MHz)
+	  * and then relock it to 800MHz(1000MHz).
+	  */
+	/* Disable the auto-restart bit o f PLL1. */
+	reg = __raw_readl(pll1_base + MXC_PLL_DP_CONFIG);
+	reg &= ~MXC_PLL_DP_CONFIG_AREN;
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_CONFIG);
+
+	if(rate >= 1000000000)
+	{
+	/* Configure the PLL1 to 1056MHz.
+	 * MFI = 10
+	 * MFN = 180
+	 * MFD = 179
+	 * PDF = 0
+	 */
+	/* MFI & PFD */
+	reg = 0xA0;
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_OP);
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_HFS_OP);
+
+	/* MFD */
+	reg = 179;
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_MFD);
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_HFS_MFD);
+
+	/* MFN */
+	reg = 180;
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_MFN);
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_HFS_MFN);
+	}
+	else
+	{
+	/* Configure the PLL1 to 864MHz.
+	  * MFI =8
+	  * MFN = 180
+	  * MFD = 179
+	  * PDF = 0
+	  */
+	/* MFI & PFD */
+	reg = 0x80;
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_OP);
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_HFS_OP);
+
+	/* MFD */
+	reg = 179;
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_MFD);
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_HFS_MFD);
+
+	/* MFN */
+	reg = 180;
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_MFN);
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_HFS_MFN);
+	}
+
+	/* Restart PLL1. */
+	reg = (MXC_PLL_DP_CTL_DPDCK0_2_EN
+			| (2 << MXC_PLL_DP_CTL_REF_CLK_SEL_OFFSET)
+			| MXC_PLL_DP_CTL_UPEN | MXC_PLL_DP_CTL_RST
+			| MXC_PLL_DP_CTL_PLM | MXC_PLL_DP_CTL_BRM0);
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_CTL);
+
+	/* Poll the lock bit. */
+	if (!WAIT(__raw_readl(pll1_base + MXC_PLL_DP_CTL) & MXC_PLL_DP_CTL_LRF,
+				SPIN_DELAY))
+		panic("pll1_set_rate relock failed\n");
+
+	/* Now update the MFN so that PLL1 is at 1000MHz/800MHz. */
+  if(rate >= 1000000000)
+	reg = 75;
+  else
+	reg = 60;
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_MFN);
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_HFS_MFN);
+
+	/* Set the LDREQ bit. */
+	reg = __raw_readl(pll1_base + MXC_PLL_DP_CONFIG);
+	reg |= MXC_PLL_DP_CONFIG_LDREQ;
+	__raw_writel(reg, pll1_base + MXC_PLL_DP_CONFIG);
+
+	/* Poll the LDREQ bit. - cleared means
+	  * DPLL has finished updating MFN.
+	  */
+	while (__raw_readl(pll1_base + MXC_PLL_DP_CONFIG)
+			& MXC_PLL_DP_CONFIG_LDREQ)
+		;
+
+	/* Now delay for 4usecs. */
+	udelay(10);
+
+	do_workaround = 0;
+}
+
+
 static unsigned long _clk_pll_get_rate(struct clk *clk)
 {
 	long mfi, mfn, mfd, pdf, ref_clk, mfn_abs;
@@ -561,10 +689,49 @@ static int _clk_pll_set_rate(struct clk *clk, unsigned long rate)
 	s64 temp64;
 	unsigned long quad_parent_rate;
 	unsigned long pll_hfsm, dp_ctl;
+	unsigned long dp_op, dp_mfd, dp_mfn;
 
 	pllbase = _get_pll_base(clk);
 
 	quad_parent_rate = 4 * clk_get_rate(clk->parent);
+
+	if(pllbase == pll1_base)
+	{
+		// For MX50, we only adjust pdf to change the PLL1 freq
+		dp_ctl = __raw_readl(pllbase + MXC_PLL_DP_CTL);
+		pll_hfsm = dp_ctl & MXC_PLL_DP_CTL_HFSM;
+
+		if (pll_hfsm == 0) {
+			dp_op = __raw_readl(pllbase + MXC_PLL_DP_OP);
+			dp_mfd = __raw_readl(pllbase + MXC_PLL_DP_MFD);
+			dp_mfn = __raw_readl(pllbase + MXC_PLL_DP_MFN);
+		} else {
+			dp_op = __raw_readl(pllbase + MXC_PLL_DP_HFS_OP);
+			dp_mfd = __raw_readl(pllbase + MXC_PLL_DP_HFS_MFD);
+			dp_mfn = __raw_readl(pllbase + MXC_PLL_DP_HFS_MFN);
+		}
+
+		mfi = (dp_op & MXC_PLL_DP_OP_MFI_MASK) >> MXC_PLL_DP_OP_MFI_OFFSET;
+		mfi = (mfi <= 5) ? 5 : mfi;
+		mfd = dp_mfd & MXC_PLL_DP_MFD_MASK;
+		mfn = dp_mfn & MXC_PLL_DP_MFN_MASK;
+	
+		for(pdf=0; pdf<16; pdf++)
+		{
+			temp64 = quad_parent_rate;
+			temp64 *= (mfi*(mfd+1) + mfn);
+			do_div(temp64, (mfd+1)*(pdf+1));
+			if((unsigned long)temp64 <= rate)
+				break;
+		}
+
+		if(pdf >= 16)
+			return -1;
+
+	}
+	else
+	{
+
 	pdf = mfi = -1;
 	while (++pdf < 16 && mfi < 5)
 		mfi = rate * (pdf+1) / quad_parent_rate;
@@ -575,6 +742,8 @@ static int _clk_pll_set_rate(struct clk *clk, unsigned long rate)
 	temp64 = rate*(pdf+1) - quad_parent_rate*mfi;
 	do_div(temp64, quad_parent_rate/1000000);
 	mfn = (long)temp64;
+
+	}
 
 	dp_ctl = __raw_readl(pllbase + MXC_PLL_DP_CTL);
 	/* use dpdck0_2 */
@@ -614,8 +783,13 @@ static int _clk_pll_enable(struct clk *clk)
 {
 	u32 reg;
 	void __iomem *pllbase;
+	u32 rate = clk_get_rate(clk);
 
 	pllbase = _get_pll_base(clk);
+
+	if (do_workaround && rate > 700000000)
+		do_pll_workaround(clk, rate);
+
 	reg = __raw_readl(pllbase + MXC_PLL_DP_CTL);
 
 	if (reg & MXC_PLL_DP_CTL_UPEN)
@@ -639,12 +813,40 @@ static void _clk_pll_disable(struct clk *clk)
 	pllbase = _get_pll_base(clk);
 	reg = __raw_readl(pllbase + MXC_PLL_DP_CTL) & ~MXC_PLL_DP_CTL_UPEN;
 	__raw_writel(reg, pllbase + MXC_PLL_DP_CTL);
+	if (clk == &pll1_main_clk)
+		do_workaround = 1;
+}
+
+static int _clk_pll1_set_rate(struct clk *clk, unsigned long rate)
+{
+	u32 reg;
+
+	if (rate < 700000000) {
+		/* Clear the PLM bit. */
+		reg = __raw_readl(pll1_base + MXC_PLL_DP_CTL);
+		reg &= ~MXC_PLL_DP_CTL_PLM;
+		__raw_writel(reg, pll1_base + MXC_PLL_DP_CTL);
+
+		/* Enable the auto-restart bit o f PLL1. */
+		reg = __raw_readl(pll1_base + MXC_PLL_DP_CONFIG);
+		reg |= MXC_PLL_DP_CONFIG_AREN;
+		__raw_writel(reg, pll1_base + MXC_PLL_DP_CONFIG);
+
+		_clk_pll_set_rate(clk, rate);
+	} else {
+		/* Above 700MHz, only 800MHz & 1000MHz freq is supported. */
+		if (rate != 800000000 && rate != 1000000000)
+			return -EINVAL;
+		do_pll_workaround(clk, rate);
+	}
+
+	return 0;
 }
 
 static struct clk pll1_main_clk = {
 	.parent = &osc_clk,
 	.get_rate = _clk_pll_get_rate,
-	.set_rate = _clk_pll_set_rate,
+	.set_rate = _clk_pll1_set_rate,
 	.enable = _clk_pll_enable,
 	.disable = _clk_pll_disable,
 	.flags = RATE_PROPAGATES,
@@ -802,13 +1004,16 @@ static unsigned long _clk_cpu_round_rate(struct clk *clk,
 	u32 i;
 	u32 wp;
 
+	rate = rate/1000000;
 	for (i = 0; i < cpu_wp_nr; i++) {
-		if (rate == cpu_wp_tbl[i].cpu_rate)
+		if (rate == cpu_wp_tbl[i].cpu_rate/1000000)
 			break;
 	}
 
-	if (i > cpu_wp_nr)
+	if (i >= cpu_wp_nr)
 		wp = 0;
+	else
+		wp = i;
 
 	return cpu_wp_tbl[wp].cpu_rate;
 }
@@ -2314,13 +2519,16 @@ static unsigned long _clk_ddr_get_rate(struct clk *clk)
 {
 	u32 reg, div;
 
+	reg = (__raw_readl(databahn + DATABAHN_CTL_REG55)) &
+			DDR_SYNC_MODE;
+	if (reg != DDR_SYNC_MODE) {
 	reg = __raw_readl(MXC_CCM_CLK_DDR);
 	div = (reg & MXC_CCM_CLK_DDR_DDR_DIV_PLL_MASK) >>
 		MXC_CCM_CLK_DDR_DDR_DIV_PLL_OFFSET;
 	if (div)
 		return clk_get_rate(clk->parent) / div;
-
-	return 0;
+	}
+	return LP_APM_CLK;
 }
 
 static int _clk_ddr_enable(struct clk *clk)
@@ -2663,6 +2871,7 @@ static struct clk display_axi_clk = {
 static int _clk_pxp_axi_enable(struct clk *clk)
 {
 	u32 reg;
+	GALLEN_DBGLOCAL_BEGIN();
 
 	_clk_enable(clk);
 
@@ -2672,6 +2881,7 @@ static int _clk_pxp_axi_enable(struct clk *clk)
 	reg |= (5 << MXC_CCM_DISPLAY_AXI_PXP_ASM_DIV_OFFSET);
 	__raw_writel(reg, MXC_CCM_DISPLAY_AXI);
 
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
@@ -2679,12 +2889,14 @@ static void _clk_pxp_axi_disable(struct clk *clk)
 {
 	u32 reg;
 
+	GALLEN_DBGLOCAL_BEGIN();
 	/* clear the auto-slow bits */
 	reg = __raw_readl(MXC_CCM_DISPLAY_AXI);
 	reg &= ~MXC_CCM_DISPLAY_AXI_PXP_ASM_EN;
 	__raw_writel(reg, MXC_CCM_DISPLAY_AXI);
 
 	_clk_disable(clk);
+	GALLEN_DBGLOCAL_END();
 }
 
 
@@ -2797,6 +3009,7 @@ static struct clk elcdif_pix_clk = {
 static int _clk_epdc_axi_set_parent(struct clk *clk, struct clk *parent)
 {
 	u32 reg, mux;
+	GALLEN_DBGLOCAL_BEGIN();
 
 	reg = __raw_readl(MXC_CCM_CLKSEQ_BYPASS);
 	mux = _get_mux(parent, &osc_clk, &pfd3_clk, &pll1_sw_clk, NULL);
@@ -2804,6 +3017,7 @@ static int _clk_epdc_axi_set_parent(struct clk *clk, struct clk *parent)
 	    (mux << MXC_CCM_CLKSEQ_BYPASS_BYPASS_EPDC_AXI_CLK_SEL_OFFSET);
 	__raw_writel(reg, MXC_CCM_CLKSEQ_BYPASS);
 
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
@@ -2825,6 +3039,7 @@ static unsigned long _clk_epdc_axi_round_rate_div(struct clk *clk,
 						u32 *new_div)
 {
 	u32 div, max_div;
+	GALLEN_DBGLOCAL_BEGIN();
 
 	max_div = (2 << 6) - 1;
 	div = DIV_ROUND_UP(clk_get_rate(clk->parent), rate);
@@ -2834,12 +3049,15 @@ static unsigned long _clk_epdc_axi_round_rate_div(struct clk *clk,
 		div++;
 	if (new_div != NULL)
 		*new_div = div;
+	GALLEN_DBGLOCAL_END();
 	return clk_get_rate(clk->parent) / div;
 }
 
 static unsigned long _clk_epdc_axi_round_rate(struct clk *clk,
 						unsigned long rate)
 {
+	GALLEN_DBGLOCAL_MUTEBEGIN();
+	GALLEN_DBGLOCAL_END();
 	return _clk_epdc_axi_round_rate_div(clk, rate, NULL);
 }
 
@@ -2848,6 +3066,8 @@ static int _clk_epdc_axi_set_rate(struct clk *clk, unsigned long rate)
 	u32 new_div;
 	u32 reg;
 
+	GALLEN_DBGLOCAL_BEGIN();
+	
 	_clk_epdc_axi_round_rate_div(clk, rate, &new_div);
 
 	reg = __raw_readl(MXC_CCM_EPDC_AXI);
@@ -2858,13 +3078,16 @@ static int _clk_epdc_axi_set_rate(struct clk *clk, unsigned long rate)
 	while (__raw_readl(MXC_CCM_CSR2) & MXC_CCM_CSR2_EPDC_AXI_BUSY)
 		;
 
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
 static int _clk_epdc_axi_enable(struct clk *clk)
 {
+	
 	u32 reg;
-
+	
+	GALLEN_DBGLOCAL_BEGIN();
 	_clk_enable(clk);
 
 	reg = __raw_readl(MXC_CCM_EPDC_AXI);
@@ -2877,13 +3100,15 @@ static int _clk_epdc_axi_enable(struct clk *clk)
 	reg |= (5 << MXC_CCM_EPDC_AXI_ASM_DIV_OFFSET);
 	__raw_writel(reg, MXC_CCM_EPDC_AXI);
 
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
 static void _clk_epdc_axi_disable(struct clk *clk)
 {
+	GALLEN_DBGLOCAL_BEGIN();
 	u32 reg;
-
+	
 	/* clear the auto-slow bits */
 	reg = __raw_readl(MXC_CCM_EPDC_AXI);
 	reg &= ~MXC_CCM_EPDC_AXI_ASM_EN;
@@ -2893,6 +3118,7 @@ static void _clk_epdc_axi_disable(struct clk *clk)
 	reg &= ~MXC_CCM_EPDC_AXI_CLKGATE_MASK;
 	__raw_writel(reg, MXC_CCM_EPDC_AXI);
 	_clk_disable(clk);
+	GALLEN_DBGLOCAL_END();
 }
 
 /* TODO: check Auto-Slow Mode */
@@ -2941,6 +3167,8 @@ static unsigned long _clk_epdc_pix_round_rate(struct clk *clk,
 						unsigned long rate)
 {
 	u32 max_div = (2 << 12) - 1;
+	GALLEN_DBGLOCAL_MUTEBEGIN();
+	GALLEN_DBGLOCAL_END();
 	return _clk_round_rate_div(clk, rate, max_div, NULL);
 }
 
@@ -2949,6 +3177,7 @@ static int _clk_epdc_pix_set_rate(struct clk *clk, unsigned long rate)
 	u32 new_div, max_div;
 	u32 reg;
 
+	GALLEN_DBGLOCAL_BEGIN();
 	max_div = (2 << 12) - 1;
 	_clk_round_rate_div(clk, rate, max_div, &new_div);
 
@@ -2962,7 +3191,7 @@ static int _clk_epdc_pix_set_rate(struct clk *clk, unsigned long rate)
 
 	while (__raw_readl(MXC_CCM_CSR2) & MXC_CCM_CSR2_EPDC_PIX_BUSY)
 		;
-
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
@@ -2970,11 +3199,12 @@ static int _clk_epdc_pix_enable(struct clk *clk)
 {
 	u32 reg;
 
+	GALLEN_DBGLOCAL_BEGIN();
 	_clk_enable(clk);
 	reg = __raw_readl(MXC_CCM_EPDCPIX);
 	reg |= MXC_CCM_EPDC_PIX_CLKGATE_MASK;
 	__raw_writel(reg, MXC_CCM_EPDCPIX);
-
+	GALLEN_DBGLOCAL_END();
 	return 0;
 }
 
@@ -2982,10 +3212,12 @@ static void _clk_epdc_pix_disable(struct clk *clk)
 {
 	u32 reg;
 
+	GALLEN_DBGLOCAL_BEGIN();
 	reg = __raw_readl(MXC_CCM_EPDCPIX);
 	reg &= ~MXC_CCM_EPDC_PIX_CLKGATE_MASK;
 	__raw_writel(reg, MXC_CCM_EPDCPIX);
 	_clk_disable(clk);
+	GALLEN_DBGLOCAL_END();
 }
 
 /* TODO: check Auto-Slow Mode */
@@ -3170,8 +3402,13 @@ static struct clk_lookup lookups[] = {
 	_REGISTER_CLOCK(NULL, "ahb_max_clk", ahb_max_clk),
 	_REGISTER_CLOCK("mxc_sdma", "sdma_ahb_clk", sdma_clk[0]),
 	_REGISTER_CLOCK("mxc_sdma", "sdma_ipg_clk", sdma_clk[1]),
+#if 1
+	_REGISTER_CLOCK("mxcintuart.0", NULL, uart2_clk[0]),
+	_REGISTER_CLOCK("mxcintuart.1", NULL, uart1_clk[0]),
+#else
 	_REGISTER_CLOCK("mxcintuart.0", NULL, uart1_clk[0]),
 	_REGISTER_CLOCK("mxcintuart.1", NULL, uart2_clk[0]),
+#endif
 	_REGISTER_CLOCK("mxcintuart.2", NULL, uart3_clk[0]),
 	_REGISTER_CLOCK("mxcintuart.3", NULL, uart4_clk[0]),
 	_REGISTER_CLOCK("mxcintuart.4", NULL, uart5_clk[0]),
@@ -3351,7 +3588,7 @@ int __init mx50_clocks_init(unsigned long ckil, unsigned long osc, unsigned long
 
 	clk_enable(&main_bus_clk);
 
-	clk_enable(&ocotp_clk);
+//	clk_enable(&ocotp_clk);
 
 	databahn = ioremap(MX50_DATABAHN_BASE_ADDR, SZ_16K);
 
@@ -3422,7 +3659,7 @@ int __init mx50_clocks_init(unsigned long ckil, unsigned long osc, unsigned long
 	clk_set_parent(&usb_phy_clk[1], &osc_clk);
 
 	/* move gpmi-nfc to 24MHz */
-	clk_set_parent(&gpmi_nfc_clk[0], &osc_clk);
+//	clk_set_parent(&gpmi_nfc_clk[0], &osc_clk);
 
 	/* set SDHC root clock as 200MHZ*/
 	clk_set_rate(&esdhc1_clk[0], 200000000);
@@ -3515,6 +3752,7 @@ static int cpu_clk_set_wp(int wp)
 {
 	struct cpu_wp *p;
 	u32 reg;
+	unsigned long flags;
 
 	if (wp == cpu_curr_wp)
 		return 0;
@@ -3527,8 +3765,14 @@ static int cpu_clk_set_wp(int wp)
 	reg = __raw_readl(MXC_CCM_CACRR);
 	reg &= ~MXC_CCM_CACRR_ARM_PODF_MASK;
 	reg |= cpu_wp_tbl[wp].cpu_podf << MXC_CCM_CACRR_ARM_PODF_OFFSET;
+
+	spin_lock_irqsave(&mx50_clk_lock, flags);
+
 	__raw_writel(reg, MXC_CCM_CACRR);
+	while (__raw_readl(MXC_CCM_CDHIPR) & MXC_CCM_CDHIPR_ARM_PODF_BUSY)
+		;
 	cpu_curr_wp = wp;
+	spin_unlock_irqrestore(&mx50_clk_lock, flags);
 
 #if defined(CONFIG_CPU_FREQ)
 	cpufreq_trig_needed = 1;

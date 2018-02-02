@@ -50,7 +50,13 @@
 
 #include "mx_sdhci.h"
 
+
+#define GDEBUG 0
+#include <linux/gallen_dbg.h>
+
 #define DRIVER_NAME "mxsdhci"
+
+
 
 #define DBG(f, x...) \
 	pr_debug(DRIVER_NAME " [%s()]: " f, __func__, ## x)
@@ -123,16 +129,27 @@ extern void gpio_sdhc_active(int module);
 extern void gpio_sdhc_inactive(int module);
 static void sdhci_dma_irq(void *devid, int error, unsigned int cnt);
 
+extern int check_hardware_name(void);
+
+
 void mxc_mmc_force_detect(int id)
 {
 	struct sdhci_host *host;
-	if ((id < 0) || (id >= MXC_SDHCI_NUM))
+
+	if ((id < 0) || (id >= MXC_SDHCI_NUM)) {
+		printk("%s(), id(%d) error !\n",__FUNCTION__,id);
 		return;
-	if (!mxc_fix_chips[id])
+	}
+	if (!mxc_fix_chips[id]) {
+		printk("%s(), mxc_fix_chips[%d] null !\n",__FUNCTION__,id);
 		return;
+	}
+
 	host = mxc_fix_chips[id]->hosts[0];
-	if (host->detect_irq)
+	if (host->detect_irq) {
+		printk("%s(), detect_irq exist !\n",__FUNCTION__);
 		return;
+	}
 
 	schedule_work(&host->cd_wq);
 	return;
@@ -1157,13 +1174,7 @@ static void sdhci_enable_sdio_irq(struct mmc_host *mmc, int enable)
 
 	spin_lock_irqsave(&host->lock, flags);
 
-	if (enable) {
-		if (host->sdio_enable++)
-			goto exit_unlock;
-	} else {
-		if (--(host->sdio_enable))
-			goto exit_unlock;
-	}
+	host->sdio_enable = enable;
 
 	ier = readl(host->ioaddr + SDHCI_INT_ENABLE);
 	prot = readl(host->ioaddr + SDHCI_HOST_CONTROL);
@@ -1198,7 +1209,7 @@ static void sdhci_enable_sdio_irq(struct mmc_host *mmc, int enable)
 	writel(prot, host->ioaddr + SDHCI_HOST_CONTROL);
 
 	mmiowb();
-      exit_unlock:
+
 	spin_unlock_irqrestore(&host->lock, flags);
 }
 
@@ -1266,6 +1277,31 @@ static void sdhci_finish_worker(struct work_struct *work)
 	del_timer(&host->timer);
 
 	mrq = host->mrq;
+
+	if (!mrq->cmd->data && !mrq->cmd->error
+			&& (mrq->cmd->flags & MMC_RSP_BUSY)) {
+		int timeout = 250000;
+
+		/* DDTS ENGcm03648.
+		 * if it's a cmd with busy, we should disable auto clock
+		 * gate and we need to poll dat0 until it's high which means
+		 * data bus is idle.
+		 * This sdhci driver disable all auto clock gate bits by
+		 * default, so we skip changing auto clock gate bits.
+		 * Be careful if auto clock gate bits logic is changed!
+		 * Poll on DATA0 line for cmd with busy signal for 250 ms
+		 */
+		while (timeout > 0 && !(readl(host->ioaddr + \
+				SDHCI_PRESENT_STATE) & SDHCI_DAT0_IDLE)) {
+			udelay(1);
+			timeout--;
+		}
+
+		if (timeout <= 0) {
+			DBG(KERN_ERR "Timeout waiting for DAT0 to go high!\n");
+			mrq->cmd->error = -ETIMEDOUT;
+		}
+	}
 
 	/*
 	 * The controller needs a reset of internal state machines
@@ -1544,51 +1580,63 @@ static void esdhc_cd_callback(struct work_struct *work)
 	unsigned int cd_status = 0;
 	struct sdhci_host *host = container_of(work, struct sdhci_host, cd_wq);
 
+	GALLEN_DBGLOCAL_BEGIN();
+
 	do {
-		if (host->detect_irq == 0)
+		if (host->detect_irq == 0) {
+			GALLEN_DBGLOCAL_RUNLOG(0);
 			break;
+		}
 		cd_status = host->plat_data->status(host->mmc->parent);
-		if (cd_status)
-			set_irq_type(host->detect_irq, IRQF_TRIGGER_FALLING);
-		else
-			set_irq_type(host->detect_irq, IRQF_TRIGGER_RISING);
+		set_irq_type(host->detect_irq, IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING);
 	} while (cd_status != host->plat_data->status(host->mmc->parent));
 
 	cd_status = host->plat_data->status(host->mmc->parent);
 
-	DBG("cd_status=%d %s\n", cd_status, cd_status ? "removed" : "inserted");
+	DBG0_MSG("cd_status=%d %s\n", cd_status, cd_status ? "removed" : "inserted");
 	/* If there is no card, call the card detection func
 	 * immediately. */
 	if (!cd_status) {
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		/* If there is a card in the slot, the timer is start
 		 * to work. Then the card detection would be carried
 		 * after the timer is timeout.
 		 * */
-		if (host->flags & SDHCI_CD_TIMEOUT)
+		if (host->flags & SDHCI_CD_TIMEOUT) {
+
+			GALLEN_DBGLOCAL_RUNLOG(2);
 			host->flags &= ~SDHCI_CD_TIMEOUT;
+		}
 		else {
 			mod_timer(&host->cd_timer, jiffies + HZ / 4);
+			GALLEN_DBGLOCAL_ESC();
 			return;
 		}
 	}
 
 	cd_status = host->plat_data->status(host->mmc->parent);
-	if (cd_status)
+	if (cd_status) {
+		GALLEN_DBGLOCAL_RUNLOG(3);
 		host->flags &= ~SDHCI_CD_PRESENT;
-	else
+	}
+	else {
+		GALLEN_DBGLOCAL_RUNLOG(4);
 		host->flags |= SDHCI_CD_PRESENT;
+	}
 	/* Detect there is a card in slot or not */
-	DBG("cd_status=%d %s\n", cd_status,
+	DBG0_MSG("cd_status=%d %s\n", cd_status,
 	    (host->flags & SDHCI_CD_PRESENT) ? "inserted" : "removed");
 
 	spin_lock_irqsave(&host->lock, flags);
 
 	if (!(host->flags & SDHCI_CD_PRESENT)) {
+		GALLEN_DBGLOCAL_RUNLOG(5);
 		printk(KERN_INFO
 		       "%s: Card removed and resetting controller.\n",
 		       mmc_hostname(host->mmc));
 		if (host->mrq) {
 			struct mmc_data *data;
+			GALLEN_DBGLOCAL_RUNLOG(6);
 			data = host->data;
 			host->data = NULL;
 
@@ -1601,6 +1649,8 @@ static void esdhc_cd_callback(struct work_struct *work)
 
 			if ((host->flags & SDHCI_USE_EXTERNAL_DMA) &&
 			    (data != NULL)) {
+
+				GALLEN_DBGLOCAL_RUNLOG(7);
 				dma_unmap_sg(mmc_dev(host->mmc), data->sg,
 					     host->dma_len, host->dma_dir);
 				host->dma_size = 0;
@@ -1612,21 +1662,31 @@ static void esdhc_cd_callback(struct work_struct *work)
 			queue_work(host->workqueue, &host->finish_wq);
 		}
 
-		if (host->init_flag > 0)
+		if (host->init_flag > 0) {
+			GALLEN_DBGLOCAL_RUNLOG(8);
 			/* The initialization of sdhc controller has been
 			 * done in the resume func */
 			host->init_flag--;
-		else
+		}
+		else {
+			GALLEN_DBGLOCAL_RUNLOG(9);
 			sdhci_init(host);
+		}
 	}
 
 	spin_unlock_irqrestore(&host->lock, flags);
 
 	if (host->flags & SDHCI_CD_PRESENT) {
+		GALLEN_DBGLOCAL_RUNLOG(10);
 		del_timer(&host->cd_timer);
 		mmc_detect_change(host->mmc, msecs_to_jiffies(100));
-	} else
+	} else {
+		GALLEN_DBGLOCAL_RUNLOG(11);
 		mmc_detect_change(host->mmc, 0);
+	}
+
+
+	GALLEN_DBGLOCAL_END();
 }
 
 /*!
@@ -1742,17 +1802,52 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
 \*****************************************************************************/
 
 #ifdef CONFIG_PM
+extern int gSleep_Mode_Suspend;
 
 static int sdhci_suspend(struct platform_device *pdev, pm_message_t state)
 {
 	struct sdhci_chip *chip;
 	int i, ret;
+	int iHWID;
+	int skip_dev_id; // ESD dev id .
 
 	chip = dev_get_drvdata(&pdev->dev);
 	if (!chip)
 		return 0;
 
 	DBG("Suspending...\n");
+	iHWID = check_hardware_name();
+
+	if (9==iHWID) {
+		// E5061X : no ESD.
+		
+	}
+	else {
+		if(11==iHWID || 34==iHWID || 35==iHWID || 41==iHWID) {
+			// E606CX . E606FXA/B , E606G2
+			skip_dev_id=0 ;//ESD @ SD1 .
+		}
+		else {
+			skip_dev_id=1 ;//ESD @ SD2 .
+		}
+
+		if (skip_dev_id == pdev->id) {
+			// skip external SD suspend .
+		 
+			printk ("[%s-%d] skip suspend for ESD (mmc%d)\n",
+					__func__,__LINE__,pdev->id);
+
+#if 1
+
+			if (!gSleep_Mode_Suspend) {
+				// enable wakeup device from ESD ,when system not in sleep mode .
+				enable_irq_wake(platform_get_irq(pdev, 1));	
+			}
+#endif
+
+			return 0;	// Joseph 100323 test
+		}
+	}
 
 	for (i = 0; i < chip->num_slots; i++) {
 		if (!chip->hosts[i])
@@ -1778,12 +1873,43 @@ static int sdhci_resume(struct platform_device *pdev)
 {
 	struct sdhci_chip *chip;
 	int i, ret;
+	int iHWID;
+	int skip_dev_id;// ESD dev id .
 
 	chip = dev_get_drvdata(&pdev->dev);
 	if (!chip)
 		return 0;
 
 	DBG("Resuming...\n");
+	iHWID = check_hardware_name();
+
+	if (9==iHWID) {
+		// E5061X : no ESD.
+	}
+	else { 
+		if(11==iHWID || 34==iHWID || 35==iHWID || 41==iHWID) {
+			// E606CX . E606FXA/B , E606G2
+			skip_dev_id=0; // ESD @ SD1
+		}
+		else {
+			skip_dev_id=1; // ESD @ SD2
+		}
+
+		if(skip_dev_id == pdev->id)  {
+			// external SD .
+			printk ("[%s-%d] skip resume for ESD (mmc%d)\n",
+					__func__,__LINE__,pdev->id);
+
+#if 1 //
+
+			if (!gSleep_Mode_Suspend) {
+				disable_irq_wake(platform_get_irq(pdev, 1));	// Joseph 20110518
+			}
+#endif
+
+			return 0;	// Joseph 100323 test
+		}
+	}
 
 	for (i = 0; i < chip->num_slots; i++) {
 		if (!chip->hosts[i])
@@ -1829,15 +1955,23 @@ static int __devinit sdhci_probe_slot(struct platform_device
 	struct sdhci_host *host;
 	mxc_dma_device_t dev_id = 0;
 
-	if (!mmc_plat)
+	GALLEN_DBGLOCAL_MUTEBEGIN_EX(64);
+
+	
+
+	if (!mmc_plat) {
+		GALLEN_DBGLOCAL_ESC();
 		return -EINVAL;
+	}
 
 	chip = dev_get_drvdata(&pdev->dev);
 	BUG_ON(!chip);
 
 	mmc = mmc_alloc_host(sizeof(struct sdhci_host), &pdev->dev);
-	if (!mmc)
+	if (!mmc) {
+		GALLEN_DBGLOCAL_ESC();
 		return -ENOMEM;
+	}
 
 	host = mmc_priv(mmc);
 	host->mmc = mmc;
@@ -1845,22 +1979,28 @@ static int __devinit sdhci_probe_slot(struct platform_device
 	host->dma = -1;
 	host->plat_data = mmc_plat;
 	if (!host->plat_data) {
+		GALLEN_DBGLOCAL_RUNLOG(0);
 		ret = -EINVAL;
 		goto out0;
 	}
+
+	GALLEN_DBGLOCAL_PRINTMSG("id=%d\n",pdev->id);
 
 	host->chip = chip;
 	chip->hosts[slot] = host;
 
 	/* Get pwr supply for eSDHC */
 	if (NULL != mmc_plat->power_mmc) {
+		GALLEN_DBGLOCAL_RUNLOG(1);
 		host->regulator_mmc =
 		    regulator_get(&pdev->dev, mmc_plat->power_mmc);
 		if (IS_ERR(host->regulator_mmc)) {
+			GALLEN_DBGLOCAL_RUNLOG(2);
 			ret = PTR_ERR(host->regulator_mmc);
 			goto out1;
 		}
 		if (regulator_enable(host->regulator_mmc) == 0) {
+			GALLEN_DBGLOCAL_RUNLOG(3);
 			DBG("mmc power on\n");
 			msleep(1);
 		}
@@ -1872,6 +2012,7 @@ static int __devinit sdhci_probe_slot(struct platform_device
 	/* Get the SDHC clock from clock system APIs */
 	host->clk = clk_get(&pdev->dev, mmc_plat->clock_mmc);
 	if (NULL == host->clk) {
+		GALLEN_DBGLOCAL_RUNLOG(4);
 		printk(KERN_ERR "MXC MMC can't get clock.\n");
 		goto out1;
 	}
@@ -1879,44 +2020,57 @@ static int __devinit sdhci_probe_slot(struct platform_device
 
 	host->res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!host->res) {
+		GALLEN_DBGLOCAL_RUNLOG(5);
 		ret = -ENOMEM;
 		goto out2;
 	}
 	host->irq = platform_get_irq(pdev, 0);
 	if (!host->irq) {
+		GALLEN_DBGLOCAL_RUNLOG(6);
 		ret = -ENOMEM;
 		goto out2;
 	}
 	host->detect_irq = platform_get_irq(pdev, 1);
+	GALLEN_DBGLOCAL_PRINTMSG("detect_irq=%d\n",host->detect_irq);
 	if (!host->detect_irq) {
-		if (mmc_plat->card_inserted_state)
+		GALLEN_DBGLOCAL_RUNLOG(7);
+		if (mmc_plat->card_inserted_state) {
+			GALLEN_DBGLOCAL_RUNLOG(8);
 			host->flags |= SDHCI_CD_PRESENT;
-		else
+		}
+		else {
+			GALLEN_DBGLOCAL_RUNLOG(9);
 			host->flags &= ~SDHCI_CD_PRESENT;
-		if ((pdev->id >= 0) && (pdev->id < MXC_SDHCI_NUM))
+		}
+		if ((pdev->id >= 0) && (pdev->id < MXC_SDHCI_NUM)) {
+			GALLEN_DBGLOCAL_RUNLOG(10);
 			mxc_fix_chips[pdev->id] = chip;
+		}
 		goto no_detect_irq;
 	}
 
 	do {
+		GALLEN_DBGLOCAL_RUNLOG(11);
 		ret = host->plat_data->status(host->mmc->parent);
-		if (ret)
-			set_irq_type(host->detect_irq, IRQF_TRIGGER_FALLING);
-		else
-			set_irq_type(host->detect_irq, IRQF_TRIGGER_RISING);
+		set_irq_type(host->detect_irq, IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING);
 	} while (ret != host->plat_data->status(host->mmc->parent));
 
 	ret = host->plat_data->status(host->mmc->parent);
-	if (ret)
+	if (ret) {
+		GALLEN_DBGLOCAL_RUNLOG(12);
 		host->flags &= ~SDHCI_CD_PRESENT;
-	else
+	}
+	else {
+		GALLEN_DBGLOCAL_RUNLOG(13);
 		host->flags |= SDHCI_CD_PRESENT;
+	}
 
       no_detect_irq:
 	DBG("slot %d at 0x%x, irq %d \n", slot, host->res->start, host->irq);
 	if (!request_mem_region(host->res->start,
 				host->res->end -
 				host->res->start + 1, pdev->name)) {
+		GALLEN_DBGLOCAL_RUNLOG(14);
 		printk(KERN_ERR "request_mem_region failed\n");
 		ret = -ENOMEM;
 		goto out2;
@@ -1924,6 +2078,7 @@ static int __devinit sdhci_probe_slot(struct platform_device
 	host->ioaddr = (void *)ioremap(host->res->start, host->res->end -
 				       host->res->start + 1);
 	if (!host->ioaddr) {
+		GALLEN_DBGLOCAL_RUNLOG(15);
 		ret = -ENOMEM;
 		goto out3;
 	}
@@ -1935,6 +2090,7 @@ static int __devinit sdhci_probe_slot(struct platform_device
 	    SDHCI_VENDOR_VER_SHIFT;
 	version = (version & SDHCI_SPEC_VER_MASK) >> SDHCI_SPEC_VER_SHIFT;
 	if (version != 1) {
+		GALLEN_DBGLOCAL_RUNLOG(16);
 		printk(KERN_ERR "%s: Unknown controller version (%d). "
 		       "You may experience problems.\n", mmc_hostname(mmc),
 		       version);
@@ -1942,18 +2098,29 @@ static int __devinit sdhci_probe_slot(struct platform_device
 
 	caps = readl(host->ioaddr + SDHCI_CAPABILITIES);
 
-	if (chip->quirks & SDHCI_QUIRK_FORCE_DMA)
+	if (chip->quirks & SDHCI_QUIRK_FORCE_DMA) {
+		GALLEN_DBGLOCAL_RUNLOG(16);
 		host->flags |= SDHCI_USE_DMA;
-	else if (!(caps & SDHCI_CAN_DO_DMA))
+	}
+	else if (!(caps & SDHCI_CAN_DO_DMA)) {
+		GALLEN_DBGLOCAL_RUNLOG(17);
 		DBG("Controller doesn't have DMA capability\n");
+	}
 	else if (chip->
 		 quirks & (SDHCI_QUIRK_INTERNAL_ADVANCED_DMA |
-			   SDHCI_QUIRK_INTERNAL_SIMPLE_DMA))
+			   SDHCI_QUIRK_INTERNAL_SIMPLE_DMA)) {
+
+		GALLEN_DBGLOCAL_RUNLOG(18);
 		host->flags |= SDHCI_USE_DMA;
-	else if (chip->quirks & (SDHCI_QUIRK_EXTERNAL_DMA_MODE))
+	}
+	else if (chip->quirks & (SDHCI_QUIRK_EXTERNAL_DMA_MODE)) {
+		GALLEN_DBGLOCAL_RUNLOG(19);
 		host->flags |= SDHCI_USE_EXTERNAL_DMA;
-	else
+	}
+	else {
+		GALLEN_DBGLOCAL_RUNLOG(20);
 		host->flags &= ~SDHCI_USE_DMA;
+	}
 
 	/*
 	 * These definitions of eSDHC are not compatible with the SD Host
@@ -1972,18 +2139,27 @@ static int __devinit sdhci_probe_slot(struct platform_device
 	mmc->caps = MMC_CAP_SDIO_IRQ;
 	mmc->caps |= mmc_plat->caps;
 
-	if (caps & SDHCI_CAN_DO_HISPD)
+	if (caps & SDHCI_CAN_DO_HISPD) {
+		GALLEN_DBGLOCAL_RUNLOG(21);
 		mmc->caps |= MMC_CAP_SD_HIGHSPEED | MMC_CAP_MMC_HIGHSPEED;
+	}
 
 	mmc->ocr_avail = mmc_plat->ocr_mask;
-	if (caps & SDHCI_CAN_VDD_330)
+	if (caps & SDHCI_CAN_VDD_330) {
+		GALLEN_DBGLOCAL_RUNLOG(22);
 		mmc->ocr_avail |= MMC_VDD_32_33 | MMC_VDD_33_34;
-	if (caps & SDHCI_CAN_VDD_300)
+	}
+	if (caps & SDHCI_CAN_VDD_300) {
+		GALLEN_DBGLOCAL_RUNLOG(23);
 		mmc->ocr_avail |= MMC_VDD_29_30 | MMC_VDD_30_31;
-	if (caps & SDHCI_CAN_VDD_180)
+	}
+	if (caps & SDHCI_CAN_VDD_180) {
+		GALLEN_DBGLOCAL_RUNLOG(24);
 		mmc->ocr_avail |= MMC_VDD_165_195;
+	}
 
 	if (mmc->ocr_avail == 0) {
+		GALLEN_DBGLOCAL_RUNLOG(25);
 		printk(KERN_ERR "%s: Hardware doesn't report any "
 		       "support voltages.\n", mmc_hostname(mmc));
 		ret = -ENODEV;
@@ -1995,20 +2171,30 @@ static int __devinit sdhci_probe_slot(struct platform_device
 	/*
 	 * Maximum number of segments. Hardware cannot do scatter lists.
 	 */
-	if (host->flags & SDHCI_USE_DMA)
+	if (host->flags & SDHCI_USE_DMA) {
+		GALLEN_DBGLOCAL_RUNLOG(26);
+
 		mmc->max_hw_segs = 1;
-	else
+	}
+	else {
+		GALLEN_DBGLOCAL_RUNLOG(27);
 		mmc->max_hw_segs = 16;
+	}
 	mmc->max_phys_segs = 16;
 
 	/*
 	 * Maximum number of sectors in one transfer. Limited by DMA boundary
 	 * size (512KiB).
 	 */
-	if (host->flags & SDHCI_USE_EXTERNAL_DMA)
+	if (host->flags & SDHCI_USE_EXTERNAL_DMA) {
+		GALLEN_DBGLOCAL_RUNLOG(28);
+
 		mmc->max_req_size = 32 * 1024;
-	else
+	}
+	else {
+		GALLEN_DBGLOCAL_RUNLOG(29);
 		mmc->max_req_size = 524288;
+	}
 
 	/*
 	 * Maximum segment size. Could be one segment with the maximum number
@@ -2023,11 +2209,15 @@ static int __devinit sdhci_probe_slot(struct platform_device
 	mmc->max_blk_size =
 	    (caps & SDHCI_MAX_BLOCK_MASK) >> SDHCI_MAX_BLOCK_SHIFT;
 	if (mmc->max_blk_size > 3) {
+
+		GALLEN_DBGLOCAL_RUNLOG(30);
 		printk(KERN_WARNING "%s: Invalid maximum block size, "
 		       "assuming 512 bytes\n", mmc_hostname(mmc));
 		mmc->max_blk_size = 512;
-	} else
+	} else {
+		GALLEN_DBGLOCAL_RUNLOG(31);
 		mmc->max_blk_size = 512 << mmc->max_blk_size;
+	}
 
 	/*
 	 * Maximum block count.
@@ -2039,9 +2229,12 @@ static int __devinit sdhci_probe_slot(struct platform_device
 	 * descriptor table.
 	 */
 	if (host->flags & SDHCI_USE_DMA) {
+
+		GALLEN_DBGLOCAL_RUNLOG(32);
 		adma_des_table = kcalloc((2 * (mmc->max_phys_segs) + 1),
 					 sizeof(unsigned int), GFP_DMA);
 		if (adma_des_table == NULL) {
+			GALLEN_DBGLOCAL_RUNLOG(33);
 			printk(KERN_ERR "Cannot allocate ADMA memory\n");
 			ret = -ENOMEM;
 			goto out3;
@@ -2063,26 +2256,37 @@ static int __devinit sdhci_probe_slot(struct platform_device
 	setup_timer(&host->cd_timer, sdhci_cd_timer, (unsigned long)host);
 
 	if (host->detect_irq) {
+		GALLEN_DBGLOCAL_RUNLOG(34);
 		ret = request_irq(host->detect_irq, sdhci_cd_irq, 0,
 				  pdev->name, host);
-		if (ret)
+		if (ret) {
+			GALLEN_DBGLOCAL_RUNLOG(35);
 			goto out4;
+		}
 	}
 
 	ret = request_irq(host->irq, sdhci_irq, IRQF_SHARED, pdev->name, host);
-	if (ret)
+	if (ret) {
+		GALLEN_DBGLOCAL_RUNLOG(36);
 		goto out5;
+	}
 
 	sdhci_init(host);
 
 	if (host->flags & SDHCI_USE_EXTERNAL_DMA) {
+		GALLEN_DBGLOCAL_RUNLOG(37);
 		/* Apply the 1-bit SDMA channel. */
-		if (host->id == 0)
+		if (host->id == 0) {
+			GALLEN_DBGLOCAL_RUNLOG(38);
 			dev_id = MXC_DMA_MMC1_WIDTH_1;
-		else
+		}
+		else {
+			GALLEN_DBGLOCAL_RUNLOG(39);
 			dev_id = MXC_DMA_MMC2_WIDTH_1;
+		}
 		host->dma = mxc_dma_request(dev_id, "MXC MMC");
 		if (host->dma < 0) {
+			GALLEN_DBGLOCAL_RUNLOG(40);
 			DBG("Cannot allocate MMC DMA channel\n");
 			goto out6;
 		}
@@ -2091,17 +2295,22 @@ static int __devinit sdhci_probe_slot(struct platform_device
 
 	mmiowb();
 
-	if (mmc_add_host(mmc) < 0)
+	if (mmc_add_host(mmc) < 0) {
+		GALLEN_DBGLOCAL_RUNLOG(41);
 		goto out6;
-	if (host->flags & SDHCI_USE_EXTERNAL_DMA)
+	}
+	if (host->flags & SDHCI_USE_EXTERNAL_DMA) {
 		printk(KERN_INFO "%s: SDHCI detect irq %d irq %d %s\n",
 		       mmc_hostname(mmc), host->detect_irq, host->irq,
 		       "EXTERNAL DMA");
-	else
+	}
+	else {
 		printk(KERN_INFO "%s: SDHCI detect irq %d irq %d %s\n",
 		       mmc_hostname(mmc), host->detect_irq, host->irq,
 		       (host->flags & SDHCI_USE_DMA) ? "INTERNAL DMA" : "PIO");
+	}
 
+	GALLEN_DBGLOCAL_ESC();
 	return 0;
 
       out6:
@@ -2131,6 +2340,8 @@ static int __devinit sdhci_probe_slot(struct platform_device
 	gpio_sdhc_inactive(pdev->id);
       out0:
 	mmc_free_host(mmc);
+
+	GALLEN_DBGLOCAL_END();
 	return ret;
 }
 

@@ -210,7 +210,8 @@ struct input_absinfo {
 #define KEY_F11			87
 #define KEY_F12			88
 #define KEY_RO			89
-#define KEY_KATAKANA		90
+//#define KEY_KATAKANA		90
+#define KEY_FL 			90
 #define KEY_HIRAGANA		91
 #define KEY_HENKAN		92
 #define KEY_KATAKANAHIRAGANA	93
@@ -1374,6 +1375,11 @@ void input_inject_event(struct input_handle *handle, unsigned int type, unsigned
 static inline void input_report_key(struct input_dev *dev, unsigned int code, int value)
 {
 	input_event(dev, EV_KEY, code, !!value);
+}
+
+static inline void input_report_zforcekey(struct input_dev *dev, unsigned int code, int value)
+{
+	input_event(dev, EV_KEY, code, value);
 }
 
 static inline void input_report_rel(struct input_dev *dev, unsigned int code, int value)

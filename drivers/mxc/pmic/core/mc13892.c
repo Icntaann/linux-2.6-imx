@@ -38,6 +38,8 @@
 #include <asm/uaccess.h>
 
 #include "pmic.h"
+extern int msp430_write(unsigned int reg, unsigned int value);
+extern int msp430_poweroff();
 
 /*
  * Defines
@@ -55,6 +57,7 @@ static struct mxc_pmic pmic_drv_data;
 struct i2c_client *mc13892_client;
 #endif
 
+#if 0
 int pmic_i2c_24bit_read(struct i2c_client *client, unsigned int reg_num,
 			unsigned int *value)
 {
@@ -101,12 +104,21 @@ int pmic_i2c_24bit_write(struct i2c_client *client,
 
 	return ret;
 }
+#endif
+
+static unsigned int pmic_reg_buffer[MXC_PMIC_MAX_REG_NUM];
 
 int pmic_read(int reg_num, unsigned int *reg_val)
 {
 	unsigned int frame = 0;
 	int ret = 0;
 
+#if 1
+	if (reg_num > MXC_PMIC_MAX_REG_NUM)
+		return PMIC_ERROR;
+	*reg_val = pmic_reg_buffer[reg_num];
+//	printk ("[%s] %s (0x%X, 0x%X)\n",__FILE__,__func__,reg_num,*reg_val);
+#else
 	if (pmic_drv_data.spi != NULL) {
 		if (reg_num > MXC_PMIC_MAX_REG_NUM)
 			return PMIC_ERROR;
@@ -123,6 +135,7 @@ int pmic_read(int reg_num, unsigned int *reg_val)
 		if (pmic_i2c_24bit_read(mc13892_client, reg_num, reg_val) == -1)
 			return PMIC_ERROR;
 	}
+#endif
 
 	return PMIC_SUCCESS;
 }
@@ -132,6 +145,13 @@ int pmic_write(int reg_num, const unsigned int reg_val)
 	unsigned int frame = 0;
 	int ret = 0;
 
+#if 1
+//	printk ("[%s] %s (0x%X, 0x%X)\n",__FILE__,__func__,reg_num,reg_val);
+	if (reg_num > MXC_PMIC_MAX_REG_NUM)
+		return PMIC_ERROR;
+	pmic_reg_buffer[reg_num] = reg_val;
+	return ret;
+#else
 	if (pmic_drv_data.spi != NULL) {
 		if (reg_num > MXC_PMIC_MAX_REG_NUM)
 			return PMIC_ERROR;
@@ -151,6 +171,7 @@ int pmic_write(int reg_num, const unsigned int reg_val)
 
 		return pmic_i2c_24bit_write(mc13892_client, reg_num, reg_val);
 	}
+#endif
 }
 
 void *pmic_alloc_data(struct device *dev)
@@ -327,9 +348,18 @@ void mc13892_power_off(void)
 {
 	unsigned int value;
 
+#if 0	
 	pmic_read_reg(REG_POWER_CTL0, &value, 0xffffff);
 
 	value |= 0x000008;
 
 	pmic_write_reg(REG_POWER_CTL0, value, 0xffffff);
+#else
+   	while (1) {
+		printk("Kernel---Power Down ---\n");
+		msp430_poweroff();
+
+      	msleep(1400);
+	}
+#endif
 }

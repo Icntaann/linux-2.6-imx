@@ -50,19 +50,22 @@ void *ddr_freq_change_iram_base;
 void __iomem *databahn_base;
 
 void (*change_ddr_freq)(void *ccm_addr, void *databahn_addr,
-			u32 freq, void *iram_ddr_settings) = NULL;
+			u32 freq, void *iram_ddr_settings, u32 pll_rate) = NULL;
 void *wait_in_iram_base;
 void (*wait_in_iram)(void *ccm_addr, void *databahn_addr, u32 sys_clk_count);
 
 extern void mx50_wait(u32 ccm_base, u32 databahn_addr, u32 sys_clk_count);
 extern int ddr_med_rate;
+extern int ddr_low_rate;
 extern void __iomem *ccm_base;
 extern void __iomem *databahn_base;
 extern void mx50_ddr_freq_change(u32 ccm_base,
 					u32 databahn_addr, u32 freq);
+extern struct cpu_wp *(*get_cpu_wp)(int *wp);
 
 static void __iomem *qosc_base;
 static int ddr_settings_size;
+static u32 pll_rate;
 
 unsigned long lpddr2_databhan_regs_offsets[][2] = {
 	{0x8, 0x0},
@@ -171,6 +174,34 @@ unsigned long lpddr2_24[][2] = {
 		{0x254, 0x00219fc1},
 		{0x258, 0x30219fd3},
 		{0x25c, 0x00219fc1} };
+
+unsigned long ddr2_databhan_regs_offsets[][2] = {
+	{0x8, 0x0},
+	{0x1c, 0x0},
+	{0x24, 0x0},
+	{0x34, 0x0},
+	{0x3c, 0x0},
+	{0x40, 0x0},
+	{0x48, 0x0} };
+
+unsigned long ddr2_133[][2] = {
+		{0x08, 0x000067e8},
+		{0x1c, 0x080a0202},
+		{0x24, 0x00244002},
+		{0x34, 0x006b0902},
+		{0x3c, 0x00001a01},
+		{0x40, 0x000503d0},
+		{0x48, 0x001c00c8} };
+
+
+unsigned long ddr2_160[][2] = {
+		{0x08, 0x00007D00},
+		{0x1c, 0x080a0202},
+		{0x24, 0x002ba002},
+		{0x34, 0x006b0902},
+		{0x3c, 0x00002001},
+		{0x40, 0x000504a0},
+		{0x48, 0x002100c8} };
 
 unsigned long mddr_databhan_regs_offsets[][2] = {
 	{0x08, 0x0},
@@ -297,28 +328,67 @@ int update_ddr_freq(int ddr_rate)
 			}
 		}
 	} else {
-		for (i = 0; i < iram_ddr_settings[0][0]; i++) {
-			iram_ddr_settings[i + 1][0] =
-					normal_databahn_settings[i][0];
-			iram_ddr_settings[i + 1][1] =
-					normal_databahn_settings[i][1];
-		}
-		if (ddr_rate == ddr_med_rate) {
-			/*Change the tref setting */
-			for (i = 0; i < iram_ddr_settings[0][0]; i++) {
-				if (iram_ddr_settings[i + 1][0] == 0x40) {
+        if (mx50_ddr_type == MX50_DDR2)
+        {
+		    if (ddr_rate == ddr_low_rate) {
+		        for (i = 0; i < iram_ddr_settings[0][0]; i++) {
+			        iram_ddr_settings[i + 1][0] =
+					        ddr2_133[i][0];
+			        iram_ddr_settings[i + 1][1] =
+					        ddr2_133[i][1];
+		        }
+            }
+		    if (ddr_rate == ddr_med_rate) {
+		        for (i = 0; i < iram_ddr_settings[0][0]; i++) {
+			        iram_ddr_settings[i + 1][0] =
+					        ddr2_160[i][0];
+			        iram_ddr_settings[i + 1][1] =
+					        ddr2_160[i][1];
+		        }
+            }
+		    else {
+		        for (i = 0; i < iram_ddr_settings[0][0]; i++) {
+			        iram_ddr_settings[i + 1][0] =
+					        normal_databahn_settings[i][0];
+			        iram_ddr_settings[i + 1][1] =
+					        normal_databahn_settings[i][1];
+		        }
+            }
+        }
+        else
+        {
+		    for (i = 0; i < iram_ddr_settings[0][0]; i++) {
+			    iram_ddr_settings[i + 1][0] =
+					    normal_databahn_settings[i][0];
+			    iram_ddr_settings[i + 1][1] =
+					    normal_databahn_settings[i][1];
+		    }
+		    if (ddr_rate == ddr_med_rate) {
+			    /*Change the tref setting */
+			    for (i = 0; i < iram_ddr_settings[0][0]; i++) {
+				    if (iram_ddr_settings[i + 1][0] == 0x40) {
+					    if (mx50_ddr_type == MX50_LPDDR2)
+						    /* LPDDR2 133MHz(125MHz). */
+						    iram_ddr_settings[i + 1][1] =
+								    0x000501d8;
+					    else
+						    /* mDDR 133MHz(125MHz). */
+						    iram_ddr_settings[i + 1][1] =
+								    0x000503bf;
+				    }
+				    else if(iram_ddr_settings[i + 1][0] == 0x24) {
 					if (mx50_ddr_type == MX50_LPDDR2)
-						/* LPDDR2 133MHz. */
+						/* LPDDR2 133MHz(125MHz). */
 						iram_ddr_settings[i + 1][1] =
-								0x00050180;
-					else
-						/* mDDR 133MHz. */
+								0x00222605;
+					if(mx50_ddr_type == MX50_MDDR)
+						/* mDDR 133MHz(125MHz) */
 						iram_ddr_settings[i + 1][1] =
-								0x00050208;
-					break;
-				}
-			}
-		}
+								0x00222602;
+                	}
+			    }
+		    }
+        }
 	}
 	/* Disable all masters from accessing the DDR. */
 	reg = __raw_readl(qosc_base + HW_QOS_DISABLE);
@@ -327,8 +397,9 @@ int update_ddr_freq(int ddr_rate)
 	udelay(100);
 
 	/* Set the DDR to default freq. */
+	if (mx50_ddr_type != MX50_DDR2) 
 	change_ddr_freq(ccm_base, databahn_base, ddr_rate,
-					iram_ddr_settings);
+					iram_ddr_settings, pll_rate);
 
 	/* Enable all masters to access the DDR. */
 	__raw_writel(reg, qosc_base + HW_QOS_DISABLE_CLR);
@@ -341,8 +412,12 @@ void init_ddr_settings(void)
 	unsigned long iram_paddr;
 	unsigned int reg;
 	int i;
+	struct cpu_wp *cpu_wp_tbl;
 	struct clk *ddr_clk = clk_get(NULL, "ddr_clk");
 
+	cpu_wp_tbl = get_cpu_wp(&i);
+	pll_rate = cpu_wp_tbl[0].pll_rate;
+	
 	databahn_base = ioremap(MX50_DATABAHN_BASE_ADDR, SZ_16K);
 
 	/* Find the memory type, LPDDR2 or mddr. */
@@ -350,6 +425,10 @@ void init_ddr_settings(void)
 	if (mx50_ddr_type == MX50_LPDDR2) {
 		normal_databahn_settings = lpddr2_databhan_regs_offsets;
 		ddr_settings_size = ARRAY_SIZE(lpddr2_databhan_regs_offsets);
+		}
+	else if (mx50_ddr_type == MX50_DDR2) {
+		normal_databahn_settings = ddr2_databhan_regs_offsets;
+		ddr_settings_size = ARRAY_SIZE(ddr2_databhan_regs_offsets);
 		}
 	else if (mx50_ddr_type == MX50_MDDR) {
 		normal_databahn_settings = mddr_databhan_regs_offsets;
@@ -369,7 +448,7 @@ void init_ddr_settings(void)
 	/* Store the size of the array in iRAM also,
 	 * increase the size by 8 bytes.
 	 */
-	iram_ddr_settings = iram_alloc(ddr_settings_size + 8, &iram_paddr);
+	iram_ddr_settings = iram_alloc((ddr_settings_size+1)*8, &iram_paddr);
 	if (iram_ddr_settings == NULL) {
 			printk(KERN_DEBUG
 			"%s: failed to allocate iRAM memory for ddr settings\n",

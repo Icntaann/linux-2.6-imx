@@ -88,6 +88,7 @@
 
 #define	SWMODE_MASK	0xF
 #define SWMODE_AUTO	0x8
+#define SWMODE_PWM_AUTO	0x6
 
 /* CPU */
 static struct regulator_consumer_supply sw1_consumers[] = {
@@ -96,6 +97,7 @@ static struct regulator_consumer_supply sw1_consumers[] = {
 	}
 };
 
+#if 0
 static struct regulator_consumer_supply sw4_consumers[] = {
 	{
 		/* sgtl5000 */
@@ -111,6 +113,7 @@ static struct regulator_consumer_supply vgen1_consumers[] = {
 		.dev_name = "1-000a",
 	},
 };
+#endif
 
 struct mc13892;
 
@@ -133,7 +136,7 @@ static struct regulator_init_data sw1_init = {
 	.num_consumer_supplies = ARRAY_SIZE(sw1_consumers),
 	.consumer_supplies = sw1_consumers,
 };
-
+#if 0
 static struct regulator_init_data sw2_init = {
 	.constraints = {
 		.name = "SW2",
@@ -343,12 +346,13 @@ static struct regulator_init_data gpo4_init = {
 		.valid_ops_mask = REGULATOR_CHANGE_STATUS,
 	}
 };
+#endif
 
 static int mc13892_regulator_init(struct mc13892 *mc13892)
 {
 	unsigned int value, register_mask;
 	printk("Initializing regulators for mx50 rdp.\n");
-
+#if 0
 	/* enable standby controll for all regulators */
 	pmic_read_reg(REG_MODE_0, &value, 0xffffff);
 	value |= REG_MODE_0_ALL_MASK;
@@ -366,7 +370,7 @@ static int mc13892_regulator_init(struct mc13892 *mc13892)
 		register_mask = (SWMODE_MASK << SW1MODE_LSB) |
 		       (SWMODE_MASK << SW2MODE_LSB);
 		value &= ~register_mask;
-		value |= (SWMODE_AUTO << SW1MODE_LSB) |
+		value |= (SWMODE_PWM_AUTO << SW1MODE_LSB) |
 			(SWMODE_AUTO << SW2MODE_LSB);
 		pmic_write_reg(REG_SW_4, value, 0xffffff);
 
@@ -410,7 +414,9 @@ static int mc13892_regulator_init(struct mc13892 *mc13892)
 	mc13892_register_regulator(mc13892, MC13892_GPO2, &gpo2_init);
 	mc13892_register_regulator(mc13892, MC13892_GPO3, &gpo3_init);
 	mc13892_register_regulator(mc13892, MC13892_GPO4, &gpo4_init);
-
+#else
+	mc13892_register_regulator(mc13892, MC13892_SW1, &sw1_init);
+#endif
 	regulator_has_full_constraints();
 
 	return 0;
@@ -422,7 +428,7 @@ static struct mc13892_platform_data mc13892_plat = {
 
 static struct spi_board_info __initdata mc13892_spi_device = {
 	.modalias = "pmic_spi",
-	.irq = gpio_to_irq(114),
+// Joseph 20110527	.irq = gpio_to_irq(114),
 	.max_speed_hz = 6000000,	/* max spi SCK clock speed in HZ */
 	.bus_num = 3,
 	.chip_select = 0,
